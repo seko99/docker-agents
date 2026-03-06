@@ -8,7 +8,7 @@
 - Данные авторизации `codex` сохраняются в `CODEX_HOME_DIR` (`./.codex-home` по умолчанию).
 - В образ включен Go-стек: `go`, `golangci-lint v2`, `swag`, `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`, `git`, `curl`, `jq`, `rg`, `make`, `docker` (CLI).
 - Для `testcontainers` используется отдельный внутренний сервис `dockerd`, без проброса `docker.sock` хоста в `codex`.
-- Git remote-операции (`fetch/pull/push/clone` по `ssh/http/https/git`) заблокированы в контейнере.
+- Git remote-операции разрешены только по secure-протоколам (`ssh`/`https`); `git://` блокируется.
 
 ## Использование
 1. Переменные лежат в `.env` (уже заполнен). При необходимости правьте:
@@ -23,6 +23,7 @@ LOCAL_GID=1000
 GOPRIVATE=gitlab.yourdomain.org/*
 GONOSUMDB=gitlab.yourdomain.org/*
 GONOPROXY=gitlab.yourdomain.org/*
+GIT_ALLOW_PROTOCOL=file:https:ssh
 ```
 
 Для нового окружения можно взять шаблон `.env.example`.

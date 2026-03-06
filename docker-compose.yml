@@ -38,7 +38,7 @@ services:
       GOPRIVATE: ${GOPRIVATE:-gitlab.yourdomain.org/*}
       GONOSUMDB: ${GONOSUMDB:-gitlab.yourdomain.org/*}
       GONOPROXY: ${GONOPROXY:-gitlab.yourdomain.org/*}
-      GIT_ALLOW_PROTOCOL: file
+      GIT_ALLOW_PROTOCOL: ${GIT_ALLOW_PROTOCOL:-file:https:ssh}
       GIT_TERMINAL_PROMPT: "0"
       DOCKER_HOST: tcp://dockerd:2375
       TESTCONTAINERS_HOST_OVERRIDE: dockerd
@@ -73,7 +73,7 @@ services:
       PATH: /usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/codex-home/go/bin:/go/bin
       CODEX_HOME: /codex-home
       HOME: /codex-home/home
-      GIT_ALLOW_PROTOCOL: file
+      GIT_ALLOW_PROTOCOL: ${GIT_ALLOW_PROTOCOL:-file:https:ssh}
       GIT_TERMINAL_PROMPT: "0"
     volumes:
       - ${PROJECT_DIR:-./}:/workspace:rw
