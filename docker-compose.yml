@@ -46,11 +46,99 @@ services:
       dockerd:
         condition: service_healthy
     volumes:
-      - ${PROJECT_DIR:-./}:/workspace:rw
-      - ${CODEX_HOME_DIR:-./.codex-home}:/codex-home:rw
-      - ${HOST_SSH_DIR:-/home/seko/.ssh}:/codex-home/home/.ssh:ro
-      - ${HOST_GITCONFIG:-/home/seko/.gitconfig}:/codex-home/home/.gitconfig:ro
+      - type: bind
+        source: ${PROJECT_DIR:-/home/seko/RemoteProjects/ai/demo}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CODEX_HOME_DIR:-~/.codex}
+        target: /codex-home
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_SSH_DIR:-~/.ssh}
+        target: /codex-home/home/.ssh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_GITCONFIG:-~/.gitconfig}
+        target: /codex-home/home/.gitconfig
+        read_only: true
+        bind:
+          create_host_path: false
     command: ["--dangerously-bypass-approvals-and-sandbox"]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /root
+
+  codex-exec:
+    build:
+      context: .
+      dockerfile: Dockerfile.codex
+    working_dir: /workspace
+    init: true
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      PATH: /usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/codex-home/go/bin:/go/bin
+      CODEX_HOME: /codex-home
+      HOME: /codex-home/home
+      XDG_CACHE_HOME: /codex-home/cache/xdg
+      GOPATH: /codex-home/go
+      GOBIN: /codex-home/go/bin
+      GOCACHE: /codex-home/cache/go-build
+      GOMODCACHE: /codex-home/cache/gomod
+      GOLANGCI_LINT_CACHE: /codex-home/cache/golangci-lint
+      GOPRIVATE: ${GOPRIVATE:-gitlab.yourdomain.org/*}
+      GONOSUMDB: ${GONOSUMDB:-gitlab.yourdomain.org/*}
+      GONOPROXY: ${GONOPROXY:-gitlab.yourdomain.org/*}
+      GIT_ALLOW_PROTOCOL: ${GIT_ALLOW_PROTOCOL:-file:https:ssh}
+      GIT_TERMINAL_PROMPT: "0"
+      DOCKER_HOST: tcp://dockerd:2375
+      TESTCONTAINERS_HOST_OVERRIDE: dockerd
+      CODEX_PROMPT: ${CODEX_PROMPT:-}
+      CODEX_EXEC_FLAGS: ${CODEX_EXEC_FLAGS:---dangerously-bypass-approvals-and-sandbox}
+    depends_on:
+      dockerd:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${PROJECT_DIR:-./}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CODEX_HOME_DIR:-~/.codex}
+        target: /codex-home
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_SSH_DIR:-~/.ssh}
+        target: /codex-home/home/.ssh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_GITCONFIG:-~/.gitconfig}
+        target: /codex-home/home/.gitconfig
+        read_only: true
+        bind:
+          create_host_path: false
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        set -euo pipefail
+        if [[ -z "$${CODEX_PROMPT}" ]]; then
+          echo "CODEX_PROMPT is required" >&2
+          exit 1
+        fi
+        exec codex exec $${CODEX_EXEC_FLAGS} -- "$${CODEX_PROMPT}"
     cap_drop:
       - ALL
     security_opt:
@@ -76,10 +164,28 @@ services:
       GIT_ALLOW_PROTOCOL: ${GIT_ALLOW_PROTOCOL:-file:https:ssh}
       GIT_TERMINAL_PROMPT: "0"
     volumes:
-      - ${PROJECT_DIR:-./}:/workspace:rw
-      - ${CODEX_HOME_DIR:-./.codex-home}:/codex-home:rw
-      - ${HOST_SSH_DIR:-/home/seko/.ssh}:/codex-home/home/.ssh:ro
-      - ${HOST_GITCONFIG:-/home/seko/.gitconfig}:/codex-home/home/.gitconfig:ro
+      - type: bind
+        source: ${PROJECT_DIR:-./}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CODEX_HOME_DIR:-./.codex-home}
+        target: /codex-home
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_SSH_DIR:-/home/seko/.ssh}
+        target: /codex-home/home/.ssh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HOST_GITCONFIG:-/home/seko/.gitconfig}
+        target: /codex-home/home/.gitconfig
+        read_only: true
+        bind:
+          create_host_path: false
     command: ["login"]
     cap_drop:
       - ALL

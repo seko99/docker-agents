@@ -2,12 +2,27 @@
 
 set -euo pipefail
 
+load_env_file() {
+  local env_file="$1"
+
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+}
+
 usage() {
   cat <<'EOF'
-Usage: ./do-task.sh [--plan] [--implement] [--review] [--all] <jira-browse-url>
+Usage: ./do-task.sh [--plan] [--implement] [--review] [--all] <jira-browse-url|jira-issue-key>
 
 Required environment variables:
-  JIRA_API_KEY   Jira API key used in Authorization: Bearer <token> for --plan
+  JIRA_API_KEY    Jira API key used in Authorization: Bearer <token> for --plan
+
+Optional environment variables:
+  JIRA_BASE_URL   Jira base URL like https://jira.example.ru
+                  Required when passing only a Jira issue key like MON-3288
 EOF
 }
 
@@ -19,27 +34,60 @@ require_cmd() {
 }
 
 extract_issue_key() {
-  local browse_url="$1"
-  local normalized_url issue_key
+  local jira_ref="$1"
+  local normalized_ref issue_key
 
-  normalized_url="${browse_url%/}"
-  issue_key="${normalized_url##*/}"
+  normalized_ref="${jira_ref%/}"
 
-  if [[ "$normalized_url" != */browse/* ]] || [[ -z "$issue_key" ]]; then
-    echo "Expected Jira browse URL like https://jira.example.ru/browse/MON-3288" >&2
+  if [[ "$normalized_ref" == *"://"* ]]; then
+    issue_key="${normalized_ref##*/}"
+
+    if [[ "$normalized_ref" != */browse/* ]] || [[ -z "$issue_key" ]]; then
+      echo "Expected Jira browse URL like https://jira.example.ru/browse/MON-3288" >&2
+      exit 1
+    fi
+
+    printf '%s\n' "$issue_key"
+    return
+  fi
+
+  issue_key="$normalized_ref"
+
+  if [[ ! "$issue_key" =~ ^[A-Z][A-Z0-9_]*-[0-9]+$ ]]; then
+    echo "Expected Jira issue key like MON-3288 or browse URL like https://jira.example.ru/browse/MON-3288" >&2
     exit 1
   fi
 
   printf '%s\n' "$issue_key"
 }
 
-build_jira_api_url() {
-  local browse_url="$1"
-  local normalized_url base_url issue_key
+build_jira_browse_url() {
+  local jira_ref="$1"
+  local issue_key base_url
 
-  normalized_url="${browse_url%/}"
-  issue_key="$(extract_issue_key "$browse_url")"
-  base_url="${normalized_url%/browse/*}"
+  if [[ "$jira_ref" == *"://"* ]]; then
+    printf '%s\n' "${jira_ref%/}"
+    return
+  fi
+
+  if [[ -z "${JIRA_BASE_URL:-}" ]]; then
+    echo "JIRA_BASE_URL is required when passing only a Jira issue key." >&2
+    exit 1
+  fi
+
+  issue_key="$(extract_issue_key "$jira_ref")"
+  base_url="${JIRA_BASE_URL%/}"
+
+  printf '%s/browse/%s\n' "$base_url" "$issue_key"
+}
+
+build_jira_api_url() {
+  local jira_ref="$1"
+  local browse_url base_url issue_key
+
+  browse_url="$(build_jira_browse_url "$jira_ref")"
+  issue_key="$(extract_issue_key "$jira_ref")"
+  base_url="${browse_url%/browse/*}"
 
   printf '%s/rest/api/2/issue/%s\n' "$base_url" "$issue_key"
 }
@@ -75,6 +123,8 @@ require_jira_task_file() {
     exit 1
   fi
 }
+
+load_env_file ".env"
 
 run_plan=false
 run_implement=false
@@ -128,9 +178,10 @@ if [[ "$run_review" == true ]]; then
   require_cmd claude
 fi
 
-jira_browse_url="$1"
-issue_key="$(extract_issue_key "$jira_browse_url")"
-jira_api_url="$(build_jira_api_url "$jira_browse_url")"
+jira_ref="$1"
+issue_key="$(extract_issue_key "$jira_ref")"
+jira_browse_url="$(build_jira_browse_url "$jira_ref")"
+jira_api_url="$(build_jira_api_url "$jira_ref")"
 jira_task_file="./${issue_key}.json"
 
 export JIRA_BROWSE_URL="$jira_browse_url"
@@ -156,7 +207,8 @@ fi
 if [[ "$run_implement" == true ]]; then
   require_jira_task_file "$jira_task_file"
   echo "Running Codex implementation mode"
-  codex exec --full-auto "$CODEX_IMPLEMENT_PROMPT"
+  #codex exec --full-auto "$CODEX_IMPLEMENT_PROMPT"
+  docker-compose -f ~/RemoteProjects/ai/docker-agents/docker-compose.yml run --rm codex-exec "$CODEX_IMPLEMENT_PROMPT"
 fi
 
 if [[ "$run_review" == true ]]; then
