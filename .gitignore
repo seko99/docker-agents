@@ -1,3 +1,5 @@
 .env.local
 .codex
+.claude
 .idea
+.venv
