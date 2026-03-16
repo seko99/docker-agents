@@ -148,7 +148,7 @@ services:
       - /tmp:exec,mode=1777
       - /root
 
-  codex-verify:
+  verify-build:
     build:
       context: .
       dockerfile: Dockerfile.codex

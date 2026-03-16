@@ -20,6 +20,7 @@ try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import WordCompleter
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.styles import Style
     from rich.console import Console
     from rich.panel import Panel
@@ -33,7 +34,7 @@ except ImportError as exc:
 
 
 DEFAULT_DOCKER_COMPOSE_FILE = "/home/seko/RemoteProjects/ai/docker-agents/docker-compose.yml"
-COMMANDS = ("plan", "implement", "review", "review-fix")
+COMMANDS = ("plan", "implement", "review", "review-fix", "test")
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 REVIEW_FILE_RE = re.compile(r"^review-(.+)-(\d+)\.md$")
 REVIEW_REPLY_FILE_RE = re.compile(r"^review-reply-(.+)-(\d+)\.md$")
@@ -173,16 +174,19 @@ def load_env_file(env_file: Path) -> None:
 def usage() -> str:
     return """Usage:
   ./do-task.py <jira-browse-url|jira-issue-key>
+  ./do-task.py --force <jira-browse-url|jira-issue-key>
   ./do-task.py plan [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py implement [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py review [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py review-fix [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
+  ./do-task.py test [--dry] [--verbose] <jira-browse-url|jira-issue-key>
 
 Interactive Mode:
   When started with only a Jira task, the script opens an interactive shell.
-  Available slash commands: /plan, /implement, /review, /review-fix, /help, /exit
+  Available slash commands: /plan, /implement, /review, /review-fix, /test, /help, /exit
 
 Flags:
+  --force         In interactive mode, force refresh Jira task and task summary
   --dry           Fetch Jira task, but print docker/codex/claude commands
                   instead of executing them
   --verbose       Show live stdout/stderr of launched commands
@@ -456,6 +460,33 @@ def run_codex_in_docker(
     )
 
 
+def run_verify_build_in_docker(
+    config: Config,
+    docker_compose_cmd: list[str],
+    *,
+    label_text: str,
+) -> None:
+    print_info(label_text)
+    try:
+        run_command(
+            docker_compose_cmd
+            + [
+                "-f",
+                config.docker_compose_file,
+                "run",
+                "--rm",
+                "verify-build",
+            ],
+            env=os.environ.copy(),
+            dry_run=config.dry_run,
+            verbose=config.verbose,
+            label="verify-build",
+        )
+    except subprocess.CalledProcessError as exc:
+        print_error(f"Build verification failed with exit code {exc.returncode}")
+        raise
+
+
 def print_prompt(tool_name: str, prompt: str) -> None:
     console.print(Panel(prompt, title=f"{tool_name} Prompt", border_style="blue"))
 
@@ -594,7 +625,7 @@ def check_prerequisites(config: Config) -> tuple[str, str, list[str]]:
     if config.command == "review":
         claude_cmd = resolve_cmd("claude", "CLAUDE_BIN")
 
-    if config.command in {"implement", "review-fix"}:
+    if config.command in {"implement", "review-fix", "test"}:
         docker_compose_cmd = resolve_docker_compose_cmd()
         if not Path(config.docker_compose_file).is_file():
             raise TaskRunnerError(f"docker-compose file not found: {config.docker_compose_file}")
@@ -658,6 +689,11 @@ def execute_command(config: Config) -> None:
             docker_compose_cmd,
             implement_prompt,
             label_text="Running Codex implementation mode in isolated Docker",
+        )
+        run_verify_build_in_docker(
+            config,
+            docker_compose_cmd,
+            label_text="Running build verification in isolated Docker",
         )
         return
 
@@ -791,6 +827,24 @@ def execute_command(config: Config) -> None:
                 [review_fix_file],
                 "Review-fix mode did not produce the required review-fix artifact.",
             )
+        run_verify_build_in_docker(
+            config,
+            docker_compose_cmd,
+            label_text="Running build verification in isolated Docker",
+        )
+        return
+
+    if config.command == "test":
+        require_jira_task_file(config.jira_task_file)
+        require_artifacts(
+            plan_artifacts(config.task_key),
+            "Test mode requires plan artifacts from the planning phase.",
+        )
+        run_verify_build_in_docker(
+            config,
+            docker_compose_cmd,
+            label_text="Running build verification in isolated Docker",
+        )
         return
 
     raise TaskRunnerError(f"Unsupported command: {config.command}")
@@ -839,6 +893,13 @@ def summarize_task(jira_ref: str) -> tuple[str, str]:
     return config.jira_issue_key, summary_text
 
 
+def resolve_task_identity(jira_ref: str) -> tuple[str, str]:
+    config = build_config("plan", jira_ref)
+    summary_path = Path(task_summary_file(config.task_key))
+    summary_text = summary_path.read_text(encoding="utf-8").strip() if summary_path.is_file() else ""
+    return config.jira_issue_key, summary_text
+
+
 def parse_cli_args(argv: list[str]) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -879,6 +940,7 @@ def interactive_help() -> None:
             "/implement [extra prompt]\n"
             "/review [extra prompt]\n"
             "/review-fix [extra prompt]\n"
+            "/test\n"
             "/help\n"
             "/exit",
             title="Interactive Commands",
@@ -916,23 +978,51 @@ def parse_interactive_command(line: str, jira_ref: str) -> Config | None:
     )
 
 
-def run_interactive(jira_ref: str) -> int:
-    issue_key, summary_text = summarize_task(jira_ref)
+def run_interactive(jira_ref: str, *, force_refresh: bool = False) -> int:
+    config = build_config("plan", jira_ref)
+    jira_task_path = Path(config.jira_task_file)
+
+    if force_refresh or not jira_task_path.is_file():
+        issue_key, summary_text = summarize_task(jira_ref)
+    else:
+        issue_key, summary_text = resolve_task_identity(jira_ref)
+
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    bindings = KeyBindings()
+
+    @bindings.add("tab")
+    def _(event) -> None:
+        buffer = event.app.current_buffer
+        if buffer.complete_state:
+            buffer.complete_next()
+        else:
+            buffer.start_completion(select_first=True)
+
     session = PromptSession(
         completer=WordCompleter(
-            ["/plan", "/implement", "/review", "/review-fix", "/help", "/exit"],
+            ["/plan", "/implement", "/review", "/review-fix", "/test", "/help", "/exit"],
             ignore_case=True,
+            pattern=re.compile(r"[/a-zA-Z0-9_-]+"),
         ),
         history=FileHistory(str(HISTORY_FILE)),
+        key_bindings=bindings,
+        complete_while_typing=False,
         style=Style.from_dict({"prompt": "bold #5f87ff"}),
     )
 
     console.print(
         Panel(
-            f"Interactive mode for [bold]{issue_key}[/]\n"
-            f"{summary_text}\n\n"
-            "Use /help to see commands.",
+            (
+                f"Interactive mode for [bold]{issue_key}[/]\n"
+                f"{summary_text}\n\n"
+                "Use /help to see commands."
+            )
+            if summary_text
+            else (
+                f"Interactive mode for [bold]{issue_key}[/]\n"
+                "Using existing Jira task file.\n\n"
+                "Use /help to see commands."
+            ),
             title="do-task",
             border_style="green",
         )
@@ -960,10 +1050,15 @@ def run_interactive(jira_ref: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     load_env_file(Path(".env"))
     argv = list(sys.argv[1:] if argv is None else argv)
+    force_refresh = False
+
+    if argv and argv[0] == "--force":
+        force_refresh = True
+        argv = argv[1:]
 
     try:
         if len(argv) == 1 and not argv[0].startswith("-") and argv[0] not in COMMANDS:
-            return run_interactive(argv[0])
+            return run_interactive(argv[0], force_refresh=force_refresh)
 
         args = parse_cli_args(argv)
         config = build_config_from_args(args)
