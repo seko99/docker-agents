@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -34,7 +34,7 @@ except ImportError as exc:
 
 
 DEFAULT_DOCKER_COMPOSE_FILE = "/home/seko/RemoteProjects/ai/docker-agents/docker-compose.yml"
-COMMANDS = ("plan", "implement", "review", "review-fix", "test")
+COMMANDS = ("plan", "implement", "review", "review-fix", "test", "auto")
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 REVIEW_FILE_RE = re.compile(r"^review-(.+)-(\d+)\.md$")
 REVIEW_REPLY_FILE_RE = re.compile(r"^review-reply-(.+)-(\d+)\.md$")
@@ -93,6 +93,7 @@ TASK_SUMMARY_PROMPT_TEMPLATE = (
     "Сделай краткое резюме задачи, на 1-2 абзаца, "
     "запиши в {task_summary_file}."
 )
+AUTO_REVIEW_FIX_EXTRA_PROMPT = "Исправлять только блокеры, критикалы и важные"
 
 
 class TaskRunnerError(Exception):
@@ -180,10 +181,11 @@ def usage() -> str:
   ./do-task.py review [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py review-fix [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py test [--dry] [--verbose] <jira-browse-url|jira-issue-key>
+  ./do-task.py auto [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
 
 Interactive Mode:
   When started with only a Jira task, the script opens an interactive shell.
-  Available slash commands: /plan, /implement, /review, /review-fix, /test, /help, /exit
+  Available slash commands: /plan, /implement, /review, /review-fix, /test, /auto, /help, /exit
 
 Flags:
   --force         In interactive mode, force refresh Jira task and task summary
@@ -513,6 +515,16 @@ def print_ready_to_merge() -> None:
     )
 
 
+def print_auto_complete() -> None:
+    console.print(
+        Panel(
+            "[bold green]Auto pipeline finished[/]",
+            title="Auto",
+            border_style="green",
+        )
+    )
+
+
 def codex_model() -> str:
     return os.environ.get("CODEX_MODEL", DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
 
@@ -633,7 +645,47 @@ def check_prerequisites(config: Config) -> tuple[str, str, list[str]]:
     return codex_cmd, claude_cmd, docker_compose_cmd
 
 
-def execute_command(config: Config) -> None:
+def build_phase_config(base_config: Config, command: str) -> Config:
+    return replace(base_config, command=command)
+
+
+def append_prompt_text(base_prompt: str | None, suffix: str) -> str:
+    if not base_prompt or not base_prompt.strip():
+        return suffix
+    return f"{base_prompt.strip()}\n{suffix}"
+
+
+def run_auto_pipeline(config: Config) -> None:
+    print_info("Running auto pipeline: plan -> implement -> test -> review/review-fix/test")
+
+    execute_command(build_phase_config(config, "plan"))
+    execute_command(build_phase_config(config, "implement"), run_followup_verify=False)
+    execute_command(build_phase_config(config, "test"))
+
+    for iteration in range(1, 4):
+        print_info(f"Starting auto review iteration {iteration}/3")
+        ready_to_merge = execute_command(build_phase_config(config, "review"))
+        if ready_to_merge:
+            print_auto_complete()
+            return
+
+        execute_command(
+            replace(
+                build_phase_config(config, "review-fix"),
+                extra_prompt=append_prompt_text(config.extra_prompt, AUTO_REVIEW_FIX_EXTRA_PROMPT),
+            ),
+            run_followup_verify=False,
+        )
+        execute_command(build_phase_config(config, "test"))
+
+    print_info("Auto pipeline reached the maximum of 3 review iterations")
+
+
+def execute_command(config: Config, *, run_followup_verify: bool = True) -> bool:
+    if config.command == "auto":
+        run_auto_pipeline(config)
+        return False
+
     codex_cmd, claude_cmd, docker_compose_cmd = check_prerequisites(config)
 
     os.environ["JIRA_BROWSE_URL"] = config.jira_browse_url
@@ -676,7 +728,7 @@ def execute_command(config: Config) -> None:
             plan_artifacts(config.task_key),
             "Plan mode did not produce the required artifacts.",
         )
-        return
+        return False
 
     if config.command == "implement":
         require_jira_task_file(config.jira_task_file)
@@ -690,12 +742,13 @@ def execute_command(config: Config) -> None:
             implement_prompt,
             label_text="Running Codex implementation mode in isolated Docker",
         )
-        run_verify_build_in_docker(
-            config,
-            docker_compose_cmd,
-            label_text="Running build verification in isolated Docker",
-        )
-        return
+        if run_followup_verify:
+            run_verify_build_in_docker(
+                config,
+                docker_compose_cmd,
+                label_text="Running build verification in isolated Docker",
+            )
+        return False
 
     if config.command == "review":
         require_jira_task_file(config.jira_task_file)
@@ -773,6 +826,7 @@ def execute_command(config: Config) -> None:
             verbose=config.verbose,
             label=f"codex:{codex_model()}",
         )
+        ready_to_merge = False
         if not config.dry_run:
             require_artifacts(
                 [review_reply_file],
@@ -791,7 +845,8 @@ def execute_command(config: Config) -> None:
             print_summary("Codex Reply Summary", review_reply_summary_text)
             if Path(READY_TO_MERGE_FILE).is_file():
                 print_ready_to_merge()
-        return
+                ready_to_merge = True
+        return ready_to_merge
 
     if config.command == "review-fix":
         require_jira_task_file(config.jira_task_file)
@@ -827,12 +882,13 @@ def execute_command(config: Config) -> None:
                 [review_fix_file],
                 "Review-fix mode did not produce the required review-fix artifact.",
             )
-        run_verify_build_in_docker(
-            config,
-            docker_compose_cmd,
-            label_text="Running build verification in isolated Docker",
-        )
-        return
+        if run_followup_verify:
+            run_verify_build_in_docker(
+                config,
+                docker_compose_cmd,
+                label_text="Running build verification in isolated Docker",
+            )
+        return False
 
     if config.command == "test":
         require_jira_task_file(config.jira_task_file)
@@ -845,7 +901,7 @@ def execute_command(config: Config) -> None:
             docker_compose_cmd,
             label_text="Running build verification in isolated Docker",
         )
-        return
+        return False
 
     raise TaskRunnerError(f"Unsupported command: {config.command}")
 
@@ -941,6 +997,7 @@ def interactive_help() -> None:
             "/review [extra prompt]\n"
             "/review-fix [extra prompt]\n"
             "/test\n"
+            "/auto [extra prompt]\n"
             "/help\n"
             "/exit",
             title="Interactive Commands",
@@ -1000,7 +1057,7 @@ def run_interactive(jira_ref: str, *, force_refresh: bool = False) -> int:
 
     session = PromptSession(
         completer=WordCompleter(
-            ["/plan", "/implement", "/review", "/review-fix", "/test", "/help", "/exit"],
+            ["/plan", "/implement", "/review", "/review-fix", "/test", "/auto", "/help", "/exit"],
             ignore_case=True,
             pattern=re.compile(r"[/a-zA-Z0-9_-]+"),
         ),
