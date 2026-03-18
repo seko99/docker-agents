@@ -35,7 +35,18 @@ except ImportError as exc:
 
 
 DEFAULT_DOCKER_COMPOSE_FILE = "/home/seko/RemoteProjects/ai/docker-agents/docker-compose.yml"
-COMMANDS = ("plan", "implement", "review", "review-fix", "test", "auto", "auto-status", "auto-reset")
+COMMANDS = (
+    "plan",
+    "implement",
+    "review",
+    "review-fix",
+    "test",
+    "test-fix",
+    "test-linter-fix",
+    "auto",
+    "auto-status",
+    "auto-reset",
+)
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 REVIEW_FILE_RE = re.compile(r"^review-(.+)-(\d+)\.md$")
 REVIEW_REPLY_FILE_RE = re.compile(r"^review-reply-(.+)-(\d+)\.md$")
@@ -96,6 +107,8 @@ TASK_SUMMARY_PROMPT_TEMPLATE = (
     "Сделай краткое резюме задачи, на 1-2 абзаца, "
     "запиши в {task_summary_file}."
 )
+TEST_FIX_PROMPT_TEMPLATE = "Прогони тесты, исправь ошибки."
+TEST_LINTER_FIX_PROMPT_TEMPLATE = "Прогони линтер, исправь замечания."
 AUTO_REVIEW_FIX_EXTRA_PROMPT = "Исправлять только блокеры, критикалы и важные"
 
 
@@ -413,6 +426,8 @@ def usage() -> str:
   ./do-task.py review [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py review-fix [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py test [--dry] [--verbose] <jira-browse-url|jira-issue-key>
+  ./do-task.py test-fix [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
+  ./do-task.py test-linter-fix [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py auto [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py auto [--dry] [--verbose] [--prompt <text>] --from <phase> <jira-browse-url|jira-issue-key>
   ./do-task.py auto --help-phases
@@ -421,7 +436,7 @@ def usage() -> str:
 
 Interactive Mode:
   When started with only a Jira task, the script opens an interactive shell.
-  Available slash commands: /plan, /implement, /review, /review-fix, /test, /auto, /auto-status, /auto-reset, /help, /exit
+  Available slash commands: /plan, /implement, /review, /review-fix, /test, /test-fix, /test-linter-fix, /auto, /auto-status, /auto-reset, /help, /exit
 
 Flags:
   --force         In interactive mode, force refresh Jira task and task summary
@@ -969,7 +984,7 @@ def check_prerequisites(config: Config) -> tuple[str, str, list[str]]:
     if config.command == "review":
         claude_cmd = resolve_cmd("claude", "CLAUDE_BIN")
 
-    if config.command in {"implement", "review-fix", "test"}:
+    if config.command in {"implement", "review-fix", "test", "test-fix", "test-linter-fix"}:
         docker_compose_cmd = resolve_docker_compose_cmd()
         if not Path(config.docker_compose_file).is_file():
             raise TaskRunnerError(f"docker-compose file not found: {config.docker_compose_file}")
@@ -1152,6 +1167,8 @@ def execute_command(config: Config, *, run_followup_verify: bool = True) -> bool
         ),
         config.extra_prompt,
     )
+    test_fix_prompt = format_prompt(TEST_FIX_PROMPT_TEMPLATE, config.extra_prompt)
+    test_linter_fix_prompt = format_prompt(TEST_LINTER_FIX_PROMPT_TEMPLATE, config.extra_prompt)
 
     if config.command == "plan":
         if config.verbose:
@@ -1347,6 +1364,34 @@ def execute_command(config: Config, *, run_followup_verify: bool = True) -> bool
         )
         return False
 
+    if config.command == "test-fix":
+        require_jira_task_file(config.jira_task_file)
+        require_artifacts(
+            plan_artifacts(config.task_key),
+            "Test-fix mode requires plan artifacts from the planning phase.",
+        )
+        run_codex_in_docker(
+            config,
+            docker_compose_cmd,
+            test_fix_prompt,
+            label_text="Running Codex test-fix mode in isolated Docker",
+        )
+        return False
+
+    if config.command == "test-linter-fix":
+        require_jira_task_file(config.jira_task_file)
+        require_artifacts(
+            plan_artifacts(config.task_key),
+            "Test-linter-fix mode requires plan artifacts from the planning phase.",
+        )
+        run_codex_in_docker(
+            config,
+            docker_compose_cmd,
+            test_linter_fix_prompt,
+            label_text="Running Codex test-linter-fix mode in isolated Docker",
+        )
+        return False
+
     raise TaskRunnerError(f"Unsupported command: {config.command}")
 
 
@@ -1446,6 +1491,8 @@ def interactive_help() -> None:
             "/review [extra prompt]\n"
             "/review-fix [extra prompt]\n"
             "/test\n"
+            "/test-fix [extra prompt]\n"
+            "/test-linter-fix [extra prompt]\n"
             "/auto [extra prompt]\n"
             "/auto --from <phase> [extra prompt]\n"
             "/auto-status\n"
@@ -1524,7 +1571,20 @@ def run_interactive(jira_ref: str, *, force_refresh: bool = False) -> int:
 
     session = PromptSession(
         completer=WordCompleter(
-            ["/plan", "/implement", "/review", "/review-fix", "/test", "/auto", "/auto-status", "/auto-reset", "/help", "/exit"],
+            [
+                "/plan",
+                "/implement",
+                "/review",
+                "/review-fix",
+                "/test",
+                "/test-fix",
+                "/test-linter-fix",
+                "/auto",
+                "/auto-status",
+                "/auto-reset",
+                "/help",
+                "/exit",
+            ],
             ignore_case=True,
             pattern=re.compile(r"[/a-zA-Z0-9_-]+"),
         ),
