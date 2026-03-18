@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -11,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -34,7 +35,7 @@ except ImportError as exc:
 
 
 DEFAULT_DOCKER_COMPOSE_FILE = "/home/seko/RemoteProjects/ai/docker-agents/docker-compose.yml"
-COMMANDS = ("plan", "implement", "review", "review-fix", "test", "auto")
+COMMANDS = ("plan", "implement", "review", "review-fix", "test", "auto", "auto-status", "auto-reset")
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*-[0-9]+$")
 REVIEW_FILE_RE = re.compile(r"^review-(.+)-(\d+)\.md$")
 REVIEW_REPLY_FILE_RE = re.compile(r"^review-reply-(.+)-(\d+)\.md$")
@@ -43,6 +44,8 @@ DEFAULT_CLAUDE_REVIEW_MODEL = "opus"
 DEFAULT_CLAUDE_SUMMARY_MODEL = "haiku"
 HISTORY_FILE = Path("/home/seko/.codex/memories/do-task-history")
 READY_TO_MERGE_FILE = "ready-to-merge.md"
+AUTO_STATE_SCHEMA_VERSION = 1
+AUTO_MAX_REVIEW_ITERATIONS = 3
 console = Console()
 error_console = Console(stderr=True)
 
@@ -106,6 +109,7 @@ class Config:
     jira_ref: str
     review_fix_points: str | None
     extra_prompt: str | None
+    auto_from_phase: str | None
     dry_run: bool
     verbose: bool
     docker_compose_file: str
@@ -119,8 +123,236 @@ class Config:
     jira_task_file: str
 
 
+@dataclass
+class AutoStepState:
+    id: str
+    command: str
+    status: str = "pending"
+    review_iteration: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    return_code: int | None = None
+    note: str | None = None
+
+
+@dataclass
+class AutoPipelineState:
+    schema_version: int
+    issue_key: str
+    jira_ref: str
+    status: str
+    current_step: str | None
+    max_review_iterations: int
+    updated_at: str
+    last_error: dict[str, str | int | None] | None = None
+    steps: list[AutoStepState] = field(default_factory=list)
+
+
 def artifact_file(prefix: str, task_key: str, iteration: int) -> str:
     return f"{prefix}-{task_key}-{iteration}.md"
+
+
+def auto_state_file(task_key: str) -> Path:
+    return Path(f".do-task-state-{task_key}.json")
+
+
+def now_iso8601() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def build_auto_steps(max_review_iterations: int = AUTO_MAX_REVIEW_ITERATIONS) -> list[AutoStepState]:
+    steps = [
+        AutoStepState(id="plan", command="plan"),
+        AutoStepState(id="implement", command="implement"),
+        AutoStepState(id="test_after_implement", command="test"),
+    ]
+    for iteration in range(1, max_review_iterations + 1):
+        steps.extend(
+            [
+                AutoStepState(id=f"review_{iteration}", command="review", review_iteration=iteration),
+                AutoStepState(id=f"review_fix_{iteration}", command="review-fix", review_iteration=iteration),
+                AutoStepState(
+                    id=f"test_after_review_fix_{iteration}",
+                    command="test",
+                    review_iteration=iteration,
+                ),
+            ]
+        )
+    return steps
+
+
+def auto_phase_ids(max_review_iterations: int = AUTO_MAX_REVIEW_ITERATIONS) -> list[str]:
+    return [step.id for step in build_auto_steps(max_review_iterations)]
+
+
+def normalize_auto_phase_id(phase_id: str) -> str:
+    return phase_id.strip().lower().replace("-", "_")
+
+
+def validate_auto_phase_id(phase_id: str) -> str:
+    normalized = normalize_auto_phase_id(phase_id)
+    if normalized not in set(auto_phase_ids()):
+        raise TaskRunnerError(
+            "Unknown auto phase: "
+            f"{phase_id}\nUse 'auto --help-phases' or '/help auto' to list valid phases."
+        )
+    return normalized
+
+
+def create_auto_pipeline_state(config: Config) -> AutoPipelineState:
+    return AutoPipelineState(
+        schema_version=AUTO_STATE_SCHEMA_VERSION,
+        issue_key=config.task_key,
+        jira_ref=config.jira_ref,
+        status="pending",
+        current_step=None,
+        max_review_iterations=AUTO_MAX_REVIEW_ITERATIONS,
+        updated_at=now_iso8601(),
+        steps=build_auto_steps(),
+    )
+
+
+def auto_step_from_dict(data: dict[str, object]) -> AutoStepState:
+    return AutoStepState(
+        id=str(data["id"]),
+        command=str(data["command"]),
+        status=str(data.get("status", "pending")),
+        review_iteration=int(data["review_iteration"]) if data.get("review_iteration") is not None else None,
+        started_at=str(data["started_at"]) if data.get("started_at") is not None else None,
+        finished_at=str(data["finished_at"]) if data.get("finished_at") is not None else None,
+        return_code=int(data["return_code"]) if data.get("return_code") is not None else None,
+        note=str(data["note"]) if data.get("note") is not None else None,
+    )
+
+
+def auto_pipeline_from_dict(data: dict[str, object]) -> AutoPipelineState:
+    return AutoPipelineState(
+        schema_version=int(data.get("schema_version", 0)),
+        issue_key=str(data["issue_key"]),
+        jira_ref=str(data["jira_ref"]),
+        status=str(data["status"]),
+        current_step=str(data["current_step"]) if data.get("current_step") is not None else None,
+        max_review_iterations=int(data.get("max_review_iterations", AUTO_MAX_REVIEW_ITERATIONS)),
+        updated_at=str(data.get("updated_at", "")),
+        last_error=data.get("last_error") if isinstance(data.get("last_error"), dict) else None,
+        steps=[auto_step_from_dict(item) for item in data.get("steps", [])],
+    )
+
+
+def load_auto_pipeline_state(config: Config) -> AutoPipelineState | None:
+    state_path = auto_state_file(config.task_key)
+    if not state_path.is_file():
+        return None
+
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise TaskRunnerError(f"Failed to parse auto state file {state_path}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise TaskRunnerError(f"Invalid auto state file format: {state_path}")
+
+    state = auto_pipeline_from_dict(raw)
+    if state.schema_version != AUTO_STATE_SCHEMA_VERSION:
+        raise TaskRunnerError(
+            f"Unsupported auto state schema in {state_path}: {state.schema_version}"
+        )
+    return state
+
+
+def save_auto_pipeline_state(state: AutoPipelineState) -> None:
+    state.updated_at = now_iso8601()
+    auto_state_file(state.issue_key).write_text(
+        json.dumps(asdict(state), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def reset_auto_pipeline_state(config: Config) -> bool:
+    state_path = auto_state_file(config.task_key)
+    if not state_path.exists():
+        return False
+    state_path.unlink()
+    return True
+
+
+def auto_step_by_id(state: AutoPipelineState, step_id: str) -> AutoStepState:
+    for step in state.steps:
+        if step.id == step_id:
+            return step
+    raise TaskRunnerError(f"Auto pipeline step not found: {step_id}")
+
+
+def next_auto_step(state: AutoPipelineState) -> AutoStepState | None:
+    for step in state.steps:
+        if step.status in {"running", "failed", "pending"}:
+            return step
+    return None
+
+
+def mark_auto_step_skipped(step: AutoStepState, note: str) -> None:
+    step.status = "skipped"
+    step.note = note
+    step.finished_at = now_iso8601()
+
+
+def skip_auto_steps_after_ready_to_merge(state: AutoPipelineState, current_step_id: str) -> None:
+    seen_current = False
+    for step in state.steps:
+        if not seen_current:
+            seen_current = step.id == current_step_id
+            continue
+        if step.status == "pending":
+            mark_auto_step_skipped(step, "ready-to-merge detected")
+
+
+def print_auto_state(state: AutoPipelineState) -> None:
+    lines = [
+        f"Issue: {state.issue_key}",
+        f"Status: {state.status}",
+        f"Current step: {state.current_step or '-'}",
+        f"Updated: {state.updated_at}",
+    ]
+    if state.last_error:
+        lines.append(
+            "Last error: "
+            f"{state.last_error.get('step')} "
+            f"(exit {state.last_error.get('return_code')}, {state.last_error.get('message')})"
+        )
+    lines.append("")
+    for step in state.steps:
+        suffix = f" ({step.note})" if step.note else ""
+        lines.append(f"[{step.status}] {step.id}{suffix}")
+
+    console.print(Panel("\n".join(lines), title="Auto Status", border_style="cyan"))
+
+
+def print_auto_phases_help() -> None:
+    phase_lines = [
+        "Available auto phases:",
+        "",
+        "plan",
+        "implement",
+        "test_after_implement",
+    ]
+    for iteration in range(1, AUTO_MAX_REVIEW_ITERATIONS + 1):
+        phase_lines.extend(
+            [
+                f"review_{iteration}",
+                f"review_fix_{iteration}",
+                f"test_after_review_fix_{iteration}",
+            ]
+        )
+    phase_lines.extend(
+        [
+            "",
+            "You can resume auto from a phase with:",
+            "./do-task.py auto --from <phase> <jira>",
+            "or in interactive mode:",
+            "/auto --from <phase>",
+        ]
+    )
+    console.print(Panel("\n".join(phase_lines), title="Auto Phases", border_style="magenta"))
 
 
 def design_file(task_key: str) -> str:
@@ -182,10 +414,14 @@ def usage() -> str:
   ./do-task.py review-fix [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
   ./do-task.py test [--dry] [--verbose] <jira-browse-url|jira-issue-key>
   ./do-task.py auto [--dry] [--verbose] [--prompt <text>] <jira-browse-url|jira-issue-key>
+  ./do-task.py auto [--dry] [--verbose] [--prompt <text>] --from <phase> <jira-browse-url|jira-issue-key>
+  ./do-task.py auto --help-phases
+  ./do-task.py auto-status <jira-browse-url|jira-issue-key>
+  ./do-task.py auto-reset <jira-browse-url|jira-issue-key>
 
 Interactive Mode:
   When started with only a Jira task, the script opens an interactive shell.
-  Available slash commands: /plan, /implement, /review, /review-fix, /test, /auto, /help, /exit
+  Available slash commands: /plan, /implement, /review, /review-fix, /test, /auto, /auto-status, /auto-reset, /help, /exit
 
 Flags:
   --force         In interactive mode, force refresh Jira task and task summary
@@ -226,6 +462,9 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--verbose", action="store_true")
         subparser.add_argument("--prompt")
         subparser.add_argument("--help", "-h", action="store_true")
+        if command_name == "auto":
+            subparser.add_argument("--from", dest="auto_from_phase")
+            subparser.add_argument("--help-phases", action="store_true")
         subparser.add_argument("jira_ref", nargs="?")
 
     return parser
@@ -525,6 +764,35 @@ def print_auto_complete() -> None:
     )
 
 
+def print_auto_reset(config: Config, removed: bool) -> None:
+    message = (
+        f"State file {auto_state_file(config.task_key)} removed."
+        if removed
+        else "No auto state file found."
+    )
+    console.print(Panel(message, title="Auto Reset", border_style="yellow"))
+
+
+def print_auto_missing_state(config: Config) -> None:
+    console.print(
+        Panel(
+            f"No auto state file found for {config.task_key}.",
+            title="Auto Status",
+            border_style="yellow",
+        )
+    )
+
+
+def print_auto_rewind(phase_id: str) -> None:
+    console.print(
+        Panel(
+            f"Auto pipeline will continue from phase: {phase_id}",
+            title="Auto Resume",
+            border_style="yellow",
+        )
+    )
+
+
 def codex_model() -> str:
     return os.environ.get("CODEX_MODEL", DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
 
@@ -596,6 +864,7 @@ def build_config(
     *,
     review_fix_points: str | None = None,
     extra_prompt: str | None = None,
+    auto_from_phase: str | None = None,
     dry_run: bool = False,
     verbose: bool = False,
 ) -> Config:
@@ -612,6 +881,7 @@ def build_config(
         jira_ref=jira_ref,
         review_fix_points=review_fix_points,
         extra_prompt=extra_prompt,
+        auto_from_phase=validate_auto_phase_id(auto_from_phase) if auto_from_phase else None,
         dry_run=dry_run,
         verbose=verbose,
         docker_compose_file=os.environ.get("DOCKER_COMPOSE_FILE", DEFAULT_DOCKER_COMPOSE_FILE),
@@ -655,20 +925,46 @@ def append_prompt_text(base_prompt: str | None, suffix: str) -> str:
     return f"{base_prompt.strip()}\n{suffix}"
 
 
-def run_auto_pipeline(config: Config) -> None:
-    print_info("Running auto pipeline: plan -> implement -> test -> review/review-fix/test")
+def config_for_auto_step(base_config: Config, step: AutoStepState) -> Config:
+    step_config = build_phase_config(base_config, step.command)
+    if step.command == "review-fix":
+        step_config = replace(
+            step_config,
+            extra_prompt=append_prompt_text(base_config.extra_prompt, AUTO_REVIEW_FIX_EXTRA_PROMPT),
+        )
+    return step_config
 
+
+def rewind_auto_pipeline_state(state: AutoPipelineState, phase_id: str) -> None:
+    target_phase_id = validate_auto_phase_id(phase_id)
+    phase_seen = False
+    for step in state.steps:
+        if step.id == target_phase_id:
+            phase_seen = True
+        if phase_seen:
+            step.status = "pending"
+            step.started_at = None
+            step.finished_at = None
+            step.return_code = None
+            step.note = None
+        else:
+            step.status = "done"
+            step.return_code = 0
+            if step.finished_at is None:
+                step.finished_at = now_iso8601()
+    state.status = "pending"
+    state.current_step = None
+    state.last_error = None
+
+
+def run_auto_pipeline_dry_run(config: Config) -> None:
+    print_info("Dry-run auto pipeline: plan -> implement -> test -> review/review-fix/test")
     execute_command(build_phase_config(config, "plan"))
     execute_command(build_phase_config(config, "implement"), run_followup_verify=False)
     execute_command(build_phase_config(config, "test"))
-
-    for iteration in range(1, 4):
-        print_info(f"Starting auto review iteration {iteration}/3")
-        ready_to_merge = execute_command(build_phase_config(config, "review"))
-        if ready_to_merge:
-            print_auto_complete()
-            return
-
+    for iteration in range(1, AUTO_MAX_REVIEW_ITERATIONS + 1):
+        print_info(f"Dry-run auto review iteration {iteration}/{AUTO_MAX_REVIEW_ITERATIONS}")
+        execute_command(build_phase_config(config, "review"))
         execute_command(
             replace(
                 build_phase_config(config, "review-fix"),
@@ -678,12 +974,98 @@ def run_auto_pipeline(config: Config) -> None:
         )
         execute_command(build_phase_config(config, "test"))
 
-    print_info("Auto pipeline reached the maximum of 3 review iterations")
+
+def run_auto_pipeline(config: Config) -> None:
+    if config.dry_run:
+        run_auto_pipeline_dry_run(config)
+        return
+
+    state = load_auto_pipeline_state(config)
+    if state is None:
+        state = create_auto_pipeline_state(config)
+    if config.auto_from_phase:
+        rewind_auto_pipeline_state(state, config.auto_from_phase)
+        print_auto_rewind(config.auto_from_phase)
+        save_auto_pipeline_state(state)
+    elif auto_state_file(config.task_key).is_file() is False:
+        save_auto_pipeline_state(state)
+
+    print_info("Running auto pipeline with persisted state")
+    while True:
+        step = next_auto_step(state)
+        if step is None:
+            if any(existing.status == "failed" for existing in state.steps):
+                state.status = "blocked"
+            elif any(existing.status == "skipped" for existing in state.steps):
+                state.status = "completed"
+            else:
+                state.status = "max-iterations-reached"
+            state.current_step = None
+            save_auto_pipeline_state(state)
+            if state.status == "completed":
+                print_auto_complete()
+            else:
+                print_info(f"Auto pipeline finished with status: {state.status}")
+            return
+
+        state.status = "running"
+        state.current_step = step.id
+        step.status = "running"
+        step.started_at = now_iso8601()
+        step.finished_at = None
+        step.return_code = None
+        step.note = None
+        state.last_error = None
+        save_auto_pipeline_state(state)
+
+        try:
+            print_info(f"Running auto step: {step.id}")
+            result = execute_command(
+                config_for_auto_step(config, step),
+                run_followup_verify=False if step.command in {"implement", "review-fix"} else True,
+            )
+            step.status = "done"
+            step.finished_at = now_iso8601()
+            step.return_code = 0
+
+            if step.command == "review" and result:
+                skip_auto_steps_after_ready_to_merge(state, step.id)
+                state.status = "completed"
+                state.current_step = None
+                save_auto_pipeline_state(state)
+                print_auto_complete()
+                return
+        except subprocess.CalledProcessError as exc:
+            step.status = "failed"
+            step.finished_at = now_iso8601()
+            step.return_code = exc.returncode or 1
+            state.status = "blocked"
+            state.current_step = step.id
+            state.last_error = {
+                "step": step.id,
+                "return_code": exc.returncode or 1,
+                "message": "command failed",
+            }
+            save_auto_pipeline_state(state)
+            raise
+
+        save_auto_pipeline_state(state)
 
 
 def execute_command(config: Config, *, run_followup_verify: bool = True) -> bool:
     if config.command == "auto":
         run_auto_pipeline(config)
+        return False
+    if config.command == "auto-status":
+        state = load_auto_pipeline_state(config)
+        if state is None:
+            print_auto_missing_state(config)
+            return False
+        print_auto_state(state)
+        return False
+    if config.command == "auto-reset":
+        removed = reset_auto_pipeline_state(config)
+        print_auto_reset(config, removed)
         return False
 
     codex_cmd, claude_cmd, docker_compose_cmd = check_prerequisites(config)
@@ -972,6 +1354,10 @@ def parse_cli_args(argv: list[str]) -> argparse.Namespace:
         console.print(usage())
         raise SystemExit(0)
 
+    if getattr(args, "command", None) == "auto" and getattr(args, "help_phases", False):
+        print_auto_phases_help()
+        raise SystemExit(0)
+
     if not args.jira_ref:
         console.print(usage(), file=sys.stderr)
         raise SystemExit(1)
@@ -984,6 +1370,7 @@ def build_config_from_args(args: argparse.Namespace) -> Config:
         args.command,
         args.jira_ref,
         extra_prompt=getattr(args, "prompt", None),
+        auto_from_phase=getattr(args, "auto_from_phase", None),
         dry_run=args.dry,
         verbose=args.verbose,
     )
@@ -998,6 +1385,10 @@ def interactive_help() -> None:
             "/review-fix [extra prompt]\n"
             "/test\n"
             "/auto [extra prompt]\n"
+            "/auto --from <phase> [extra prompt]\n"
+            "/auto-status\n"
+            "/auto-reset\n"
+            "/help auto\n"
             "/help\n"
             "/exit",
             title="Interactive Commands",
@@ -1021,6 +1412,9 @@ def parse_interactive_command(line: str, jira_ref: str) -> Config | None:
 
     command_name = command[1:]
     if command_name == "help":
+        if len(parts) > 1 and parts[1] in {"auto", "phases"}:
+            print_auto_phases_help()
+            return None
         interactive_help()
         return None
     if command_name in {"exit", "quit"}:
@@ -1028,11 +1422,22 @@ def parse_interactive_command(line: str, jira_ref: str) -> Config | None:
     if command_name not in COMMANDS:
         raise TaskRunnerError(f"Unknown command: {command}")
 
-    return build_config(
-        command_name,
-        jira_ref,
-        extra_prompt=" ".join(parts[1:]) or None,
-    )
+    if command_name == "auto":
+        auto_from_phase = None
+        extra_parts = parts[1:]
+        if extra_parts[:1] == ["--from"]:
+            if len(extra_parts) < 2:
+                raise TaskRunnerError("auto --from requires a phase name. Use /help auto.")
+            auto_from_phase = extra_parts[1]
+            extra_parts = extra_parts[2:]
+        return build_config(
+            command_name,
+            jira_ref,
+            extra_prompt=" ".join(extra_parts) or None,
+            auto_from_phase=auto_from_phase,
+        )
+
+    return build_config(command_name, jira_ref, extra_prompt=" ".join(parts[1:]) or None)
 
 
 def run_interactive(jira_ref: str, *, force_refresh: bool = False) -> int:
@@ -1057,7 +1462,7 @@ def run_interactive(jira_ref: str, *, force_refresh: bool = False) -> int:
 
     session = PromptSession(
         completer=WordCompleter(
-            ["/plan", "/implement", "/review", "/review-fix", "/test", "/auto", "/help", "/exit"],
+            ["/plan", "/implement", "/review", "/review-fix", "/test", "/auto", "/auto-status", "/auto-reset", "/help", "/exit"],
             ignore_case=True,
             pattern=re.compile(r"[/a-zA-Z0-9_-]+"),
         ),
