@@ -720,11 +720,17 @@ def run_verify_build_in_docker(
             ],
             env=os.environ.copy(),
             dry_run=config.dry_run,
-            verbose=config.verbose,
+            verbose=False,
             label="verify-build",
+            print_failure_output=False,
         )
     except subprocess.CalledProcessError as exc:
         print_error(f"Build verification failed with exit code {exc.returncode}")
+        if not config.dry_run:
+            print_summary(
+                "Build Failure Summary",
+                summarize_build_failure(config, getattr(exc, "output", "") or ""),
+            )
         raise
 
 
@@ -805,12 +811,68 @@ def claude_summary_model() -> str:
     return os.environ.get("CLAUDE_SUMMARY_MODEL", DEFAULT_CLAUDE_SUMMARY_MODEL).strip() or DEFAULT_CLAUDE_SUMMARY_MODEL
 
 
+def truncate_text(text: str, max_chars: int = 12000) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def fallback_build_failure_summary(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    tail = lines[-8:] if lines else ["No build output captured."]
+    return "Не удалось получить summary через Claude.\n\nПоследние строки лога:\n" + "\n".join(tail)
+
+
+def summarize_build_failure(config: Config, output: str) -> str:
+    if not output.strip():
+        return "Build verification failed, but no output was captured."
+
+    try:
+        claude_cmd = resolve_cmd("claude", "CLAUDE_BIN")
+    except TaskRunnerError:
+        return fallback_build_failure_summary(output)
+
+    prompt = (
+        "Ниже лог упавшей build verification.\n"
+        "Сделай краткое резюме на русском языке, без воды.\n"
+        "Нужно обязательно выделить:\n"
+        "1. Где именно упало.\n"
+        "2. Главную причину падения.\n"
+        "3. Что нужно исправить дальше, если это очевидно.\n"
+        "Ответ дай максимум 5 короткими пунктами.\n\n"
+        f"Лог:\n{truncate_text(output)}"
+    )
+
+    print_info(f"Summarizing build failure with Claude ({claude_summary_model()})")
+    try:
+        result = subprocess.run(
+            [
+                claude_cmd,
+                "--model",
+                claude_summary_model(),
+                "-p",
+                prompt,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=os.environ.copy(),
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return fallback_build_failure_summary(output)
+
+    summary = result.stdout.strip()
+    return summary or fallback_build_failure_summary(output)
+
+
 def run_command(
     argv: list[str],
     env: dict[str, str] | None = None,
     dry_run: bool = False,
     verbose: bool = False,
     label: str | None = None,
+    print_failure_output: bool = True,
 ) -> None:
     if dry_run:
         console.print(format_command(argv, env))
@@ -851,11 +913,11 @@ def run_command(
 
     output = "".join(output_chunks)
     if process.returncode != 0:
-        if output:
+        if output and print_failure_output:
             sys.stderr.write(output)
             if not output.endswith("\n"):
                 sys.stderr.write("\n")
-        raise subprocess.CalledProcessError(process.returncode or 1, argv)
+        raise subprocess.CalledProcessError(process.returncode or 1, argv, output=output)
 
 
 def build_config(
